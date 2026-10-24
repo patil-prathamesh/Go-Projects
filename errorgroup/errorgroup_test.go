@@ -2,63 +2,67 @@ package main
 
 import (
 	"context"
-	"fmt"
-	"net/http"
-	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 	"time"
 )
 
-func TestErrorGroup(t *testing.T) {
-	srvA := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		fmt.Println("request for A", r.RemoteAddr, r.Header.Get("User-Agent"))
-		w.WriteHeader(http.StatusOK)
-	}))
-	defer srvA.Close()
+// runTasks runs `tasks` tasks of 200ms each. limit <= 0 means SetLimit is never called.
+func runTasks(t *testing.T, limit, tasks int) (peak int64, elapsed time.Duration) {
+	t.Helper()
 
-	srvC := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		fmt.Println("request for C")
-		time.Sleep(300 * time.Millisecond)
-		http.Error(w, "boom", http.StatusInternalServerError)
-	}))
-	defer srvC.Close()
+	var running, maxSeen atomic.Int64
 
-	srvB := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		fmt.Println("request for B")
-		time.Sleep(1 * time.Second)
-		w.WriteHeader(http.StatusOK)
-	}))
-	defer srvB.Close()
-
-	srvD := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		fmt.Println("request for D")
-		timer := time.NewTimer(10 * time.Second)
-		defer timer.Stop()
-
-		select {
-		case <-r.Context().Done():
-			t.Log(r.Context().Err(), "for D")
-		case <-timer.C:
-			w.WriteHeader(http.StatusOK)
-			return
-		}
-	}))
-	defer srvD.Close()
-
-	urls := []string{srvA.URL, srvB.URL, srvC.URL, srvD.URL}
-	start := time.Now()
 	grp, _ := NewGroup(context.Background())
+	if limit > 0 {
+		grp.SetLimit(limit)
+	}
 
-	for _, v := range urls {
+	start := time.Now()
+	for i := 0; i < tasks; i++ {
 		grp.Go(func(ctx context.Context) error {
-			err := check(ctx, v)
-			fmt.Println("return from", v)
-			return err
+			cur := running.Add(1)
+			defer running.Add(-1)
+
+			// raise maxSeen to cur, safely, if cur is larger
+			for {
+				old := maxSeen.Load()
+				if cur <= old || maxSeen.CompareAndSwap(old, cur) {
+					break
+				}
+			}
+
+			time.Sleep(200 * time.Millisecond)
+			return nil
 		})
 	}
 
-	err := grp.Wait()
-	t.Logf("----- %s", err.Error())
+	if err := grp.Wait(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	return maxSeen.Load(), time.Since(start)
+}
 
-	fmt.Println("time required: ", time.Since(start))
+func TestSetLimit(t *testing.T) {
+	peak, elapsed := runTasks(t, 2, 6)
+	t.Logf("limit=2: peak=%d elapsed=%v", peak, elapsed)
+
+	if peak > 2 {
+		t.Errorf("peak concurrency %d exceeds limit 2", peak)
+	}
+	if elapsed < 550*time.Millisecond {
+		t.Errorf("finished in %v, expected about 600ms (3 rounds of 2)", elapsed)
+	}
+}
+
+func TestNoLimit(t *testing.T) {
+	peak, elapsed := runTasks(t, 0, 6)
+	t.Logf("no limit: peak=%d elapsed=%v", peak, elapsed)
+
+	if peak != 6 {
+		t.Errorf("peak concurrency %d, expected 6", peak)
+	}
+	if elapsed > 450*time.Millisecond {
+		t.Errorf("took %v, expected about 200ms", elapsed)
+	}
 }

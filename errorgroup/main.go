@@ -13,6 +13,7 @@ type Group struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 	err    error
+	sem    chan struct{}
 }
 
 func NewGroup(ctx context.Context) (*Group, context.Context) {
@@ -22,10 +23,18 @@ func NewGroup(ctx context.Context) (*Group, context.Context) {
 }
 
 func (g *Group) Go(f func(ctx context.Context) error) {
+	if g.sem != nil {
+		g.sem <- struct{}{}
+	}
 	g.wg.Add(1)
 
 	go func() {
 		defer g.wg.Done()
+		defer func() {
+			if g.sem != nil {
+				<-g.sem
+			}
+		}()
 		err := f(g.ctx)
 		if err != nil {
 			g.once.Do(func() {
@@ -33,7 +42,14 @@ func (g *Group) Go(f func(ctx context.Context) error) {
 				g.cancel()
 			})
 		}
+
 	}()
+}
+
+func (g *Group) SetLimit(n int) {
+	if n >= 0 {
+		g.sem = make(chan struct{}, n)
+	}
 }
 
 func (g *Group) Wait() error {
@@ -44,7 +60,7 @@ func (g *Group) Wait() error {
 
 func check(ctx context.Context, url string) error {
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
-	fmt.Println("check for url: ",url)
+	fmt.Println("check for url: ", url)
 
 	if err != nil {
 		return fmt.Errorf("from request check %s: %w", url, err)
